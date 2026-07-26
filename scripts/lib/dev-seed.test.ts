@@ -324,6 +324,11 @@ describe("seedDevDatabase", () => {
         assert.equal(session.status, "stopped");
         assert.isNull(session.active_turn_id);
       }
+      const [threadsWithLatestTurn] = query<{ count: number }>(
+        target,
+        "SELECT COUNT(*) count FROM projection_threads WHERE latest_turn_id IS NOT NULL",
+      );
+      assert.equal(threadsWithLatestTurn?.count, 0);
     });
   });
 
@@ -434,6 +439,35 @@ describe("seedDevDatabase", () => {
       // The two highest sequences — not the two newest timestamps, and not
       // whichever two the storage order yielded.
       assert.deepStrictEqual(kept, ["skewed-4", "tie-3"]);
+    });
+  });
+
+  it("uses activity id as the final cap tiebreaker", () => {
+    withDatabases(({ source, target }) => {
+      const sourceDatabase = new NodeSqlite.DatabaseSync(source);
+      sourceDatabase.exec("DELETE FROM projection_thread_activities");
+      const insert = sourceDatabase.prepare(
+        `INSERT INTO projection_thread_activities
+         VALUES (?, 't4', 'neutral', 'tool', 'ran', '{}', 7, ?)`,
+      );
+      const tied = "2026-07-10T00:00:00.000Z";
+      insert.run("tie-a", tied);
+      insert.run("tie-z", tied);
+      sourceDatabase.close();
+
+      seedDevDatabase({
+        sourceDbPath: source,
+        targetDbPath: target,
+        threadLimit: 1,
+        activityLimit: 1,
+        seededAt: SEEDED_AT,
+      });
+
+      const kept = query<{ activity_id: string }>(
+        target,
+        "SELECT activity_id FROM projection_thread_activities",
+      );
+      assert.deepStrictEqual(kept, [{ activity_id: "tie-z" }]);
     });
   });
 
@@ -648,6 +682,35 @@ describe("seedDevDatabase", () => {
       },
       { legacySource: true },
     );
+  });
+
+  it("falls back to user messages when stored recency is missing", () => {
+    withDatabases(({ source, target }) => {
+      const sourceDatabase = new NodeSqlite.DatabaseSync(source);
+      sourceDatabase.exec("UPDATE projection_threads SET latest_user_message_at = NULL");
+      sourceDatabase
+        .prepare(
+          `UPDATE projection_thread_messages
+           SET created_at = '2099-01-01T00:00:00.000Z'
+           WHERE thread_id = 't0' AND role = 'user'`,
+        )
+        .run();
+      sourceDatabase.close();
+
+      seedDevDatabase({
+        sourceDbPath: source,
+        targetDbPath: target,
+        threadLimit: 1,
+        activityLimit: 10,
+        seededAt: SEEDED_AT,
+      });
+
+      const threads = query<{ thread_id: string }>(
+        target,
+        "SELECT thread_id FROM projection_threads",
+      );
+      assert.deepStrictEqual(threads, [{ thread_id: "t0" }]);
+    });
   });
 
   // Every statement keyed on thread ids must cost exactly one bound variable

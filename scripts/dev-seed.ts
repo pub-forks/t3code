@@ -166,16 +166,23 @@ const copyAttachments = Effect.fn("devSeed.copyAttachments")(function* (input: {
     return 0;
   }
 
-  yield* fileSystem.makeDirectory(input.targetDir, { recursive: true });
   // Attachments are decoration on a dev fixture: one unreadable file should
-  // leave the rest of the seed intact rather than fail a completed copy.
-  const copied = yield* Effect.forEach(matches, (entry) =>
-    fileSystem.copyFile(path.join(input.sourceDir, entry), path.join(input.targetDir, entry)).pipe(
-      Effect.as(1),
-      Effect.orElseSucceed(() => 0),
+  // leave the rest of the seed intact rather than fail a completed database
+  // copy. The directory itself is subject to the same rule.
+  return yield* fileSystem.makeDirectory(input.targetDir, { recursive: true }).pipe(
+    Effect.andThen(
+      Effect.forEach(matches, (entry) =>
+        fileSystem
+          .copyFile(path.join(input.sourceDir, entry), path.join(input.targetDir, entry))
+          .pipe(
+            Effect.as(1),
+            Effect.orElseSucceed(() => 0),
+          ),
+      ),
     ),
+    Effect.map((copied) => copied.reduce((total, one) => total + one, 0)),
+    Effect.orElseSucceed(() => 0),
   );
-  return copied.reduce((total, one) => total + one, 0);
 });
 
 const devSeedCli = Command.make("dev-seed", {

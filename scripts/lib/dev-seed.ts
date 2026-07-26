@@ -411,31 +411,51 @@ export function seedDevDatabase(options: DevSeedOptions): DevSeedSummary {
   }
 
   try {
-    // Threads the user actually touched most recently. Mirrors the sidebar's own
-    // ordering (packages/client-runtime/src/state/threadSort.ts). Both recency
-    // columns arrived in later migrations, so an older source database is read
-    // with whichever of them it actually has — the rest of the copy tolerates
-    // schema drift, and this query must too.
-    const recencyColumns = ["latest_user_message_at", "updated_at", "created_at"].filter((column) =>
-      hasColumn(source, "projection_threads", column),
-    );
+    // Threads the user actually touched most recently. Mirrors the sidebar's
+    // own ordering (packages/client-runtime/src/state/threadSort.ts), including
+    // its user-message scan when the materialized timestamp is null. Both
+    // recency columns arrived in later migrations, so an older source database
+    // is read with whichever inputs it actually has.
+    const recencyExpressions: Array<string> = [];
+    if (hasColumn(source, "projection_threads", "latest_user_message_at")) {
+      recencyExpressions.push('threads."latest_user_message_at"');
+    }
+    if (
+      hasTable(source, "projection_thread_messages") &&
+      ["thread_id", "role", "created_at"].every((column) =>
+        hasColumn(source, "projection_thread_messages", column),
+      )
+    ) {
+      recencyExpressions.push(`(
+        SELECT MAX(messages."created_at")
+        FROM projection_thread_messages AS messages
+        WHERE messages."thread_id" = threads."thread_id"
+          AND messages."role" = 'user'
+      )`);
+    }
+    for (const column of ["updated_at", "created_at"]) {
+      if (hasColumn(source, "projection_threads", column)) {
+        recencyExpressions.push(`threads."${column}"`);
+      }
+    }
     // SQLite's COALESCE requires at least two arguments, so a source down to a
     // single recency column — the pre-migration-017 case this filter exists to
     // support — would throw rather than degrade. `created_at` is NOT NULL from
     // migration 005 on, so there is always at least one.
     const recencyOrder =
-      recencyColumns.length > 1
-        ? `COALESCE(${recencyColumns.join(", ")})`
-        : (recencyColumns[0] ?? "rowid");
+      recencyExpressions.length > 1
+        ? `COALESCE(${recencyExpressions.join(", ")})`
+        : (recencyExpressions[0] ?? "threads.rowid");
     const activeFilters = ["deleted_at", "archived_at"]
       .filter((column) => hasColumn(source, "projection_threads", column))
-      .map((column) => `${column} IS NULL`);
+      .map((column) => `threads."${column}" IS NULL`);
     const threadIds = (
       source
         .prepare(
-          `SELECT thread_id FROM projection_threads
+          `SELECT threads."thread_id" AS thread_id
+           FROM projection_threads AS threads
            ${activeFilters.length > 0 ? `WHERE ${activeFilters.join(" AND ")}` : ""}
-           ORDER BY ${recencyOrder} DESC
+           ORDER BY ${recencyOrder} DESC, threads."thread_id" DESC
            LIMIT ?`,
         )
         .all(options.threadLimit) as Array<{ thread_id: string }>
@@ -512,7 +532,13 @@ export function seedDevDatabase(options: DevSeedOptions): DevSeedSummary {
         keyColumn: "thread_id",
         keys: threadIds,
         // Approvals are not copied (see below), so the badge must not claim any.
-        overrides: { pending_approval_count: 0, pending_user_input_count: 0 },
+        // Sessions are copied as stopped with no active turn, matching the
+        // thread.session-set projection by clearing its latest turn pointer.
+        overrides: {
+          latest_turn_id: null,
+          pending_approval_count: 0,
+          pending_user_input_count: 0,
+        },
       }),
     );
     // row_id is an AUTOINCREMENT surrogate; let the target assign its own.
@@ -553,8 +579,8 @@ export function seedDevDatabase(options: DevSeedOptions): DevSeedSummary {
         table: "projection_thread_activities",
         keyColumn: "thread_id",
         keys: threadIds,
-        // Ordered the way the app reads these back — `sequence` first, then
-        // `created_at` (ProjectionSnapshotQuery). Any other key order can keep
+        // Ordered the way the app reads these back — `sequence`, `created_at`,
+        // then `activity_id` (ProjectionSnapshotQuery). Any other key order can keep
         // rows the timeline treats as oldest: timestamps tie within a burst of
         // tool activity, and can even disagree with `sequence` outright when
         // events arrive with skewed clocks. Descending, a NULL `sequence`
@@ -564,8 +590,8 @@ export function seedDevDatabase(options: DevSeedOptions): DevSeedSummary {
         // back to the timestamp — same drift tolerance as the rest of the copy.
         perKeyLimit: {
           orderBy: hasColumn(source, "projection_thread_activities", "sequence")
-            ? `"sequence" DESC, "created_at"`
-            : `"created_at"`,
+            ? `"sequence" DESC, "created_at" DESC, "activity_id"`
+            : `"created_at" DESC, "activity_id"`,
           limit: options.activityLimit,
         },
       }),
@@ -580,6 +606,9 @@ export function seedDevDatabase(options: DevSeedOptions): DevSeedSummary {
         // No agent process is attached in the copy. A carried-over "running"
         // status with an active turn renders a thread that spins forever, and
         // ProviderSessionReaper skips reaping anything with an active turn.
+        // "ready"/"idle" are live-session completion signals to agent
+        // awareness, so preserving those would publish historical fixtures as
+        // newly completed work. Every copied session is intentionally stopped.
         overrides: { status: "stopped", active_turn_id: null, last_error: null },
       }),
     );
