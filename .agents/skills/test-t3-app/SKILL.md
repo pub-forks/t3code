@@ -86,7 +86,7 @@ If completion is uncertain, keep the environment alive and mention that it is re
 ## Troubleshoot predictably
 
 - If the browser shows an unauthenticated pairing screen, issue a new token instead of retrying the consumed URL.
-- If the pairing URL is no longer visible, create a replacement token with both `--dev-url` and `--base-url`.
-- If the replacement token is rejected, verify that the CLI and server use the identical absolute base directory and web URL.
+- If the pairing URL is no longer visible, run `bun run dev:pair`. Add `-- --base-dir <base-dir>` only when the server was started with `--home-dir`.
+- If the replacement token is rejected, verify that `dev:pair` and the server resolve the same base directory.
 - If the UI shows unexpected data, verify that every command uses the identical explicit base directory before editing anything.
 - If ports move because another instance is running, trust the current dev-runner output rather than assuming ports `13773` and `5733`.
